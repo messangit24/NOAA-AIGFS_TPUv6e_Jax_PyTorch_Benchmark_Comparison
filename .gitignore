@@ -209,10 +209,16 @@ __marimo__/
 # Editor backup files (Emacs, vim)
 *~
 *.sw[a-p]
+.*.sw[a-p]
 .DS_Store
+*.bak
+*.old*
+*.good
+*.orig
 
 # Pycharm IDE files
 .idea/
 
 # VSCode files
 *vscode*
+

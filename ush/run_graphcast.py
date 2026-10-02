@@ -1,320 +1,395 @@
-#!/usr/bin/env -S python3 -u
-
-'''
-Description: Script to call the graphcast model using gdas products
-Author: Sadegh Sadeghi Tabas (sadegh.tabas@noaa.gov)
-Revision history:
-    -20240307: Sadegh Tabas, initial code
-    -20250506: Linlin Cui, moved hard coded model weights to a json file
-'''
-import os
+#!/usr/bin/env python3
+"""
+ush/run_graphcast.py - NOAA AIGFS GraphCast TPU Forecast Inference Runner
+Supports multi-step autoregressive forecasting on Google Cloud TPU v6e.
+Uses chunked rollout to guarantee high throughput and zero OOM across 16-day forecasts.
+Supports Direct GCS Cloud Streaming (gs://) with automatic timestamps.
+"""
 import argparse
-from time import time
-from datetime import timedelta
-import dataclasses
 import functools
-import re
+import gc
+import glob
+import math
+import os
+import sys
+import time
+from datetime import datetime
+
 import haiku as hk
 import jax
+import jax.numpy as jnp
 import numpy as np
-import xarray
-import boto3
 import pandas as pd
-import pickle
+import xarray as xr
 
-from graphcast import autoregressive
-from graphcast import casting
-from graphcast import checkpoint
-from graphcast import data_utils
-from graphcast import graphcast
-from graphcast import normalization
-from graphcast import rollout
+# Import GraphCast core modules
+try:
+    from graphcast import autoregressive, casting, checkpoint, data_utils, graphcast, normalization, rollout
+except ImportError as e:
+    print(f"Error loading GraphCast modules: {e}")
+    sys.exit(1)
 
-from utils.grib2writer import Grib2Writer
 
-class GraphCastModel:
-    def __init__(
-        self, 
-        pretrained_model_path, 
-        gdas_data_path, 
-        case_name: str, 
-        config_file = None, 
-        output_dir = None, 
-        num_pressure_levels = 13, 
-        forecast_length = 64,
-    ):
-        self.pretrained_model_path = pretrained_model_path
-        self.gdas_data_path = gdas_data_path
-        self.forecast_length = forecast_length
-        self.case_name = case_name
-        self.num_pressure_levels = num_pressure_levels
-        self.config_file_path = config_file
-        
-        if output_dir is None:
-            self.output_dir = os.getcwd()
+# Global timing metrics exposed for profiling wrappers (e.g. profile_wrapper.py)
+COMPILE_TIME = 0.0
+INFERENCE_TIME = 0.0
+TOTAL_FORECAST_TIME = 0.0
+NUM_STEPS = 64
+OUTPUT_FILE = ""
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="AIGFS GraphCast TPU Forecast Runner")
+    parser.add_argument("-n", "--name", type=str, default="aigfs", help="Run name (default: aigfs)")
+    parser.add_argument("-i", "--input", type=str, required=True, help="Input initial condition NetCDF file")
+    parser.add_argument("-o", "--output", type=str, required=True, help="Output directory or GCS Bucket URI (gs://...)")
+    parser.add_argument("-w", "--weights", type=str, required=True, help="Weights path or directory containing .npz checkpoint")
+    parser.add_argument("-l", "--lead_steps", type=int, default=64, help="Number of 6-hour forecast lead steps (64 = 16 days)")
+    parser.add_argument("-c", "--chunk_size", type=int, default=None, help="Rollout chunk size on TPU (default: equal to lead_steps for single on-device rollout)")
+    parser.add_argument("--profile_dir", type=str, default=None, help="Directory to save XProf profile trace (optional)")
+    return parser.parse_args()
+
+
+def locate_checkpoint(weights_arg):
+    if os.path.isfile(weights_arg) and weights_arg.endswith(".npz"):
+        return weights_arg
+
+    if os.path.isdir(weights_arg):
+        npz_files = glob.glob(os.path.join(weights_arg, "*.npz"))
+        if not npz_files:
+            raise FileNotFoundError(f"No .npz checkpoints found in directory: {weights_arg}")
+
+        for f in npz_files:
+            base = os.path.basename(f).lower()
+            if "operational" in base and "13" in base:
+                return f
+        for f in npz_files:
+            base = os.path.basename(f).lower()
+            if "13" in base and "0.25" in base:
+                return f
+        return npz_files[0]
+
+    raise FileNotFoundError(f"Weights path {weights_arg} does not exist.")
+
+
+def locate_and_load_stats(weights_arg):
+    search_dirs = []
+    if os.path.isfile(weights_arg):
+        search_dirs.append(os.path.dirname(weights_arg))
+        search_dirs.append(os.path.join(os.path.dirname(weights_arg), "stats"))
+    elif os.path.isdir(weights_arg):
+        search_dirs.append(weights_arg)
+        search_dirs.append(os.path.join(weights_arg, "stats"))
+
+    search_dirs.extend(["/data/fix", "/data/fix/stats"])
+
+    for d in search_dirs:
+        p_diffs = os.path.join(d, "diffs_stddev_by_level.nc")
+        p_mean = os.path.join(d, "mean_by_level.nc")
+        p_stddev = os.path.join(d, "stddev_by_level.nc")
+        if os.path.exists(p_diffs) and os.path.exists(p_mean) and os.path.exists(p_stddev):
+            print(f"Loading normalization statistics from: {d}")
+            diffs_stddev = xr.load_dataset(p_diffs).compute()
+            mean = xr.load_dataset(p_mean).compute()
+            stddev = xr.load_dataset(p_stddev).compute()
+            return diffs_stddev, mean, stddev
+
+    raise FileNotFoundError(f"Normalization statistics not found in any of: {search_dirs}")
+
+
+def construct_wrapped_graphcast(model_config, task_config, diffs_stddev, mean, stddev):
+    predictor = graphcast.GraphCast(model_config, task_config)
+    predictor = casting.Bfloat16Cast(predictor)
+    predictor = normalization.InputsAndResiduals(
+        predictor,
+        diffs_stddev_by_level=diffs_stddev,
+        mean_by_level=mean,
+        stddev_by_level=stddev,
+    )
+    predictor = autoregressive.Predictor(predictor, gradient_checkpointing=False)
+    return predictor
+
+
+def main():
+    global COMPILE_TIME, INFERENCE_TIME, TOTAL_FORECAST_TIME, NUM_STEPS, OUTPUT_FILE
+
+    args = parse_args()
+    NUM_STEPS = args.lead_steps
+    timestamp_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    print("\n========================================================")
+    print("       AIGFS GRAPHCAST TPU INFERENCE RUNNER")
+    print("========================================================")
+    print(f"  • Model Name:        {args.name}")
+    print(f"  • Input Path:        {args.input}")
+    print(f"  • Output Location:   {args.output}")
+    print(f"  • Run Timestamp:     {timestamp_str} UTC")
+    print(f"  • Lead Steps:        {args.lead_steps} ({args.lead_steps * 6} Hours / {args.lead_steps * 6 // 24} Days)")
+    print(f"  • JAX Devices:       {jax.devices()}")
+    print("========================================================\n")
+
+    if not args.output.startswith("gs://"):
+        os.makedirs(args.output, exist_ok=True)
+
+    weights_path = locate_checkpoint(args.weights)
+    print(f"Loading checkpoint weights: {os.path.basename(weights_path)}...")
+
+    with open(weights_path, "rb") as f:
+        ckpt = checkpoint.load(f, graphcast.CheckPoint)
+        params = ckpt.params
+        state = {}
+        model_config = ckpt.model_config
+        task_config = ckpt.task_config
+
+    diffs_stddev, mean, stddev = locate_and_load_stats(args.weights)
+
+    if not os.path.exists(args.input):
+        raise FileNotFoundError(f"Input file not found: {args.input}")
+
+    print(f"Loading input initial condition file: {args.input}...")
+    ds = xr.open_dataset(args.input)
+
+    if "batch" in ds.dims and "batch" not in ds.coords:
+        ds = ds.assign_coords(batch=np.arange(ds.sizes["batch"]))
+    elif "batch" not in ds.dims:
+        ds = ds.expand_dims("batch", axis=0).assign_coords(batch=[0])
+
+    data_utils.add_derived_vars(ds)
+
+    if "toa_incident_solar_radiation" in task_config.input_variables and "toa_incident_solar_radiation" not in ds.data_vars:
+        data_utils.add_tisr_var(ds)
+
+    t0_datetime = pd.to_datetime(ds.coords["datetime"].values[0, -1])
+    time_coords = ds.coords["time"]
+    ds = ds.assign_coords(time=time_coords - time_coords[-1])
+
+    input_duration = pd.Timedelta(task_config.input_duration)
+    eval_inputs = ds.sel(time=slice(-input_duration + pd.Timedelta("1ns"), pd.Timedelta(0)))
+    if "datetime" in eval_inputs.coords:
+        eval_inputs = eval_inputs.drop_vars("datetime")
+    eval_inputs = eval_inputs[list(task_config.input_variables)]
+
+    if args.chunk_size is not None and args.chunk_size > 0:
+        chunk_size = min(args.chunk_size, args.lead_steps)
+    else:
+        # Default to 32 steps (or lead_steps if smaller) to maximize TPU MXU throughput
+        # while fitting comfortably within TPU v6e 32GB HBM limits
+        chunk_size = min(32, args.lead_steps)
+
+    num_chunks = math.ceil(args.lead_steps / chunk_size)
+    print(f"Execution Strategy: {num_chunks} chunk(s) of {chunk_size} steps each.")
+
+    lead_times_full = [pd.Timedelta(hours=6 * (i + 1)) for i in range(args.lead_steps)]
+    target_datetimes_full = [t0_datetime + lt for lt in lead_times_full]
+    chunk_lead_times = [pd.Timedelta(hours=6 * (i + 1)) for i in range(chunk_size)]
+
+    surface_vars = {
+        "2m_temperature", "mean_sea_level_pressure",
+        "10m_v_component_of_wind", "10m_u_component_of_wind",
+        "total_precipitation_6hr"
+    }
+
+    chunk_target_vars = {}
+    n_lat = len(ds.coords["lat"])
+    n_lon = len(ds.coords["lon"])
+    n_levels = len(task_config.pressure_levels)
+
+    for var in task_config.target_variables:
+        if var in surface_vars:
+            chunk_target_vars[var] = (
+                ("batch", "time", "lat", "lon"),
+                np.full((1, chunk_size, n_lat, n_lon), np.nan, dtype=np.float32)
+            )
         else:
-            self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        self.params = None
-        self.state = {}
-        self.model_config = None
-        self.task_config = None
-        self.diffs_stddev_by_level = None
-        self.mean_by_level = None
-        self.stddev_by_level = None
-        self.current_batch = None
-        self.inputs = None
-        self.targets = None
-        self.forcings = None
-        self.s3_bucket_name = "noaa-nws-graphcastgfs-pds"
-        self.dates = None
-        
-
-    def load_pretrained_model(self):
-        """Load pre-trained GraphCast model."""
-        if self.num_pressure_levels==13:
-            model_weights_path = f"{self.pretrained_model_path}/params/AIGFSv1.1.npz"
-        else:
-            model_weights_path = f"{self.pretrained_model_path}/params/GraphCast_ERA5_1979-2017_0p25_37pl_mesh2to6_tp-input-and-output.npz"
-
-        with open(model_weights_path, "rb") as f:
-            ckpt = checkpoint.load(f, graphcast.CheckPoint)
-            #self.params = ckpt.params
-            self.state = {}
-            self.model_config = ckpt.model_config
-            self.task_config = ckpt.task_config
-
-            #update params
-            if self.config_file_path is not None:
-                print(f'Loading params for member {self.case_name}')
-                with open(self.config_file_path, 'rb') as f:
-                    self.params = pickle.load(f)
-            else:
-                self.params = ckpt.params
-
-    def load_gdas_data(self):
-        """Load GDAS data."""
-        #with open(gdas_data_path, "rb") as f:
-        #    self.current_batch = xarray.load_dataset(f).compute()
-        self.current_batch = xarray.load_dataset(self.gdas_data_path).compute()
-        self.dates =  pd.to_datetime(self.current_batch.datetime.values)
-        
-        if (self.forecast_length + 2) > len(self.current_batch['time']):
-            print('Updating batch dataset to account for forecast length')
-            
-            diff = int(self.forecast_length + 2 - len(self.current_batch['time']))
-            ds = self.current_batch
-
-            # time and datetime update
-            curr_time_range = ds['time'].values.astype('timedelta64[ns]')
-            new_time_range = (np.arange(len(curr_time_range) + diff) * np.timedelta64(6, 'h')).astype('timedelta64[ns]')
-            ds = ds.reindex(time = new_time_range)
-            curr_datetime_range = ds['datetime'][0].values.astype('datetime64[ns]')
-            new_datetime_range = curr_datetime_range[0] + np.arange(len(curr_time_range) + diff) * np.timedelta64(6, 'h')
-            ds['datetime'][0]= new_datetime_range
-
-            self.current_batch = ds
-            print('batch dataset updated')
-            
-        
-    def extract_inputs_targets_forcings(self):
-        """Extract inputs, targets, and forcings from the loaded data."""
-        self.inputs, self.targets, self.forcings = data_utils.extract_inputs_targets_forcings(
-            self.current_batch, target_lead_times=slice("6h", f"{self.forecast_length*6}h"), **dataclasses.asdict(self.task_config)
-        )
-
-    def load_normalization_stats(self):
-        """Load normalization stats."""
-        
-        diffs_stddev_path = f"{self.pretrained_model_path}/stats/diffs_stddev_by_level.nc"
-        mean_path = f"{self.pretrained_model_path}/stats/mean_by_level.nc"
-        stddev_path = f"{self.pretrained_model_path}/stats/stddev_by_level.nc"
-        
-        with open(diffs_stddev_path, "rb") as f:
-            self.diffs_stddev_by_level = xarray.load_dataset(f).compute()
-        with open(mean_path, "rb") as f:
-            self.mean_by_level = xarray.load_dataset(f).compute()
-        with open(stddev_path, "rb") as f:
-            self.stddev_by_level = xarray.load_dataset(f).compute()
-    
-    # Jax doesn't seem to like passing configs as args through the jit. Passing it
-    # in via partial (instead of capture by closure) forces jax to invalidate the
-    # jit cache if you change configs.
-    def _with_configs(self, fn):
-        return functools.partial(fn, model_config=self.model_config, task_config=self.task_config,)
-
-    # Always pass params and state, so the usage below are simpler
-    def _with_params(self, fn):
-        return functools.partial(fn, params=self.params, state=self.state)
-
-    # Deepmind models aren't stateful, so the state is always empty, so just return the
-    # predictions. This is requiredy by the rollout code, and generally simpler.
-    @staticmethod
-    def _drop_state(fn):
-        return lambda **kw: fn(**kw)[0]
-
-    def load_model(self):
-        def construct_wrapped_graphcast(model_config, task_config):
-            """Constructs and wraps the GraphCast Predictor."""
-            # Deeper one-step predictor.
-            predictor = graphcast.GraphCast(model_config, task_config)
-
-            # Modify inputs/outputs to `graphcast.GraphCast` to handle conversion to
-            # from/to float32 to/from BFloat16.
-            predictor = casting.Bfloat16Cast(predictor)
-
-            # Applying normalization to the inputs/targets.
-            predictor = normalization.InputsAndResiduals(
-                predictor, 
-                diffs_stddev_by_level=self.diffs_stddev_by_level, 
-                mean_by_level=self.mean_by_level, 
-                stddev_by_level=self.stddev_by_level,
+            chunk_target_vars[var] = (
+                ("batch", "time", "level", "lat", "lon"),
+                np.full((1, chunk_size, n_levels, n_lat, n_lon), np.nan, dtype=np.float32)
             )
 
-            # Wraps everything so the one-step model can produce trajectories.
-            predictor = autoregressive.Predictor(predictor, gradient_checkpointing=True,)
-            return predictor
+    chunk_targets_template = xr.Dataset(
+        data_vars=chunk_target_vars,
+        coords={
+            "batch": [0],
+            "time": chunk_lead_times,
+            "lat": ds.coords["lat"],
+            "lon": ds.coords["lon"],
+            "level": list(task_config.pressure_levels),
+        }
+    )
 
-        @hk.transform_with_state
-        def run_forward(model_config, task_config, inputs, targets_template, forcings,):
-            predictor = construct_wrapped_graphcast(model_config, task_config)
-            return predictor(inputs, targets_template=targets_template, forcings=forcings,)
-        
-        t0 = time()
-        jax.jit(self._with_configs(run_forward.init))
-        self.model = self._drop_state(self._with_params(jax.jit(self._with_configs(run_forward.apply))))
-        elapsed_time = time() - t0
-        print(f"Elapsed time for compiling the model: {elapsed_time} seconds")
-    
- 
-    def get_predictions(self):
-        """Run GraphCast and save forecasts to a NetCDF file."""
+    forcings_full = xr.Dataset(
+        coords={
+            "batch": [0],
+            "time": lead_times_full,
+            "lat": ds.coords["lat"],
+            "lon": ds.coords["lon"],
+            "datetime": (("batch", "time"), [target_datetimes_full]),
+        }
+    )
+    data_utils.add_derived_vars(forcings_full)
+    data_utils.add_tisr_var(forcings_full)
+    forcings_full = forcings_full.drop_vars("datetime")[list(task_config.forcing_variables)]
 
-        print (f"start running GraphCast for {self.forecast_length} steps --> {self.forecast_length*6} hours.")
-        self.load_model()
-           
-        # Call and save f000 in grib2
-        ds = self.current_batch
-        ds = ds.drop_vars(['geopotential_at_surface','land_sea_mask', 'total_precipitation_6hr'])
-        for var in ds.data_vars:
-            if 'long_name' in ds[var].attrs:
-                del ds[var].attrs['long_name']
-        ds = ds.isel(time=slice(1, 2))
-        ds['time'] = ds['time'] - pd.Timedelta(hours=6)
+    chunk_forcings_template = forcings_full.isel(time=slice(0, chunk_size)).assign_coords(time=chunk_lead_times)
 
-        converter = Grib2Writer(
-            self.dates[0][1], 
-            case_name=self.case_name, 
-            json_path=f'{self.pretrained_model_path}/tables'
-        )
-        converter.save_grib2(ds, self.output_dir)
+    @hk.transform_with_state
+    def run_forward(m_cfg, t_cfg, inputs_data, targets_tmpl, forcings_data):
+        predictor = construct_wrapped_graphcast(m_cfg, t_cfg, diffs_stddev, mean, stddev)
+        return predictor(inputs_data, targets_template=targets_tmpl, forcings=forcings_data)
 
-        rollout.chunked_prediction(
-            self.output_dir, 
-            converter, 
-            self.model, 
-            rng=jax.random.PRNGKey(0), 
-            inputs=self.inputs, 
-            targets_template=self.targets * np.nan, 
-            forcings=self.forcings,
-        )
+    def with_configs(fn):
+        return functools.partial(fn, m_cfg=model_config, t_cfg=task_config)
 
-    def upload_to_s3(self, keep_data):
-        s3 = boto3.client('s3')
-        
-        # Extract date and time information from the input file name
-        input_file_name = os.path.basename(self.gdas_data_path)
-        
-        date_start = input_file_name.find("date-")
+    jitted_apply = jax.jit(with_configs(run_forward.apply))
 
-        # Check if "date-" is found in the input_file_name
-        if date_start != -1:
-            date_start += len("date-")  # Move to the end of "date-"
-            date = input_file_name[date_start:date_start + 8]  # Extract 8 characters as the date
-        
-            time_start = date_start + 8  # Move to the character after the date
-            time = input_file_name[time_start:time_start + 2]  # Extract 2 characters as the time
+    print(f"\nCompiling JAX graph for {chunk_size}-step chunk on TPU v6e...")
+    t_comp_start = time.perf_counter()
+    lowered = jitted_apply.lower(
+        params,
+        state,
+        jax.random.PRNGKey(0),
+        inputs_data=eval_inputs,
+        targets_tmpl=chunk_targets_template,
+        forcings_data=chunk_forcings_template,
+    )
+    compiled = lowered.compile()
+    compile_time = time.perf_counter() - t_comp_start
+    COMPILE_TIME = compile_time
+    del lowered
+    gc.collect()
+    print(f"JIT Compilation completed in {compile_time:.2f} seconds!\n")
 
+    xprof_dir = args.profile_dir or os.environ.get("XPROF_LOG_DIR")
+    if xprof_dir:
+        import contextlib
+        print(f"Attaching XProf TPU Profiler trace to rollout: {xprof_dir}...")
+        profiler_ctx = jax.profiler.trace(xprof_dir, create_perfetto_link=False)
+    else:
+        import contextlib
+        profiler_ctx = contextlib.nullcontext()
 
-        # Define S3 key paths for input and output files
-        input_s3_key = f'graphcastgfs.{date}/{time}/input/{self.gdas_data_path}'
+    print(f"Executing {args.lead_steps}-step rollout on TPU v6e ({num_chunks} chunk(s) of {chunk_size} steps)...")
+    t_infer_start = time.perf_counter()
+    current_inputs = eval_inputs
+    chunks = []
 
-        # Upload input file to S3
-        s3.upload_file(self.gdas_data_path, self.s3_bucket_name, input_s3_key)
-        
-        # Upload output files to S3
-        # Iterate over all files in the local directory and upload each one to S3
-        s3_prefix = f'graphcastgfs.{date}/{time}/forecasts_{self.num_pressure_levels}_levels'
-        
-        for root, dirs, files in os.walk(self.output_dir):
+    with profiler_ctx:
+        for c in range(num_chunks):
+            t_c_start = time.perf_counter()
+            slice_start = c * chunk_size
+            slice_end = min((c + 1) * chunk_size, args.lead_steps)
+            actual_chunk_len = slice_end - slice_start
+            slice_idx = slice(slice_start, slice_end)
+            chunk_forcings = forcings_full.isel(time=slice_idx).assign_coords(time=chunk_lead_times[:actual_chunk_len])
 
-            for file in files:
-                local_path = os.path.join(root, file)
-                relative_path = os.path.relpath(local_path, self.output_dir)
-                s3_path = os.path.join(s3_prefix, relative_path)
-            
-                # Upload the file
-                s3.upload_file(local_path, self.s3_bucket_name, s3_path)
+            pred, _ = compiled(
+                params,
+                state,
+                jax.random.PRNGKey(c),
+                inputs_data=current_inputs,
+                targets_tmpl=chunk_targets_template,
+                forcings_data=chunk_forcings,
+            )
+            first_leaf = jax.tree_util.tree_leaves(pred)[0]
+            first_leaf.block_until_ready()
 
-        print("Upload to s3 bucket completed.")
+            chunk_cpu = jax.device_get(pred)
+            del pred, first_leaf
+            gc.collect()
 
-        # Delete local files if keep_data is False
-        if not keep_data:
-            # Remove forecast data from the specified directory
-            print("Removing input and forecast data from the specified directory...")
-            try:
-                os.system(f"rm -rf {self.output_dir}")
-                os.remove(self.gdas_data_path)
-                print("Local input and output files deleted.")
-            except Exception as e:
-                print(f"Error removing input and forecast data: {str(e)}")
+            actual_lead_times = lead_times_full[slice_start:slice_end]
+            chunk_cpu = chunk_cpu.assign_coords(time=actual_lead_times)
+            chunks.append(chunk_cpu)
 
+            if c < num_chunks - 1:
+                next_frame = xr.merge([
+                    chunk_cpu.isel(time=slice(-2, None)),
+                    chunk_forcings.isel(time=slice(-2, None))
+                ])
+                if "datetime" in next_frame.coords:
+                    next_frame = next_frame.drop_vars("datetime")
+                next_inputs = rollout._get_next_inputs(current_inputs, next_frame)
+                current_inputs = next_inputs.assign_coords(time=eval_inputs.coords["time"])
+
+            t_c_end = time.perf_counter()
+            print(f"  • Chunk {c+1}/{num_chunks} completed in {t_c_end - t_c_start:.3f} s")
+
+    inference_time = time.perf_counter() - t_infer_start
+    INFERENCE_TIME = inference_time
+    TOTAL_FORECAST_TIME = compile_time + inference_time
+
+    print(
+        f"\nRollout execution completed on TPU in {inference_time:.3f} seconds! "
+        f"({(inference_time / args.lead_steps) * 1000.0:.2f} ms/step)\n"
+    )
+
+    print("Formatting output forecast dataset...")
+    if len(chunks) == 1:
+        full_pred = chunks[0]
+    else:
+        full_pred = xr.concat(chunks, dim="time")
+
+    for v in full_pred.data_vars:
+        dims = list(full_pred[v].dims)
+        if "batch" in dims and "time" in dims and dims[0] != "batch":
+            new_order = ["batch", "time"] + [d for d in dims if d not in ("batch", "time")]
+            full_pred[v] = full_pred[v].transpose(*new_order)
+
+    full_pred = full_pred.assign_coords(datetime=(("batch", "time"), [target_datetimes_full]))
+
+    hours = args.lead_steps * 6
+    days = hours // 24
+    lead_str = f"{days}day" if hours % 24 == 0 else f"{hours}h"
+    cycle_str = t0_datetime.strftime("t%Hz")
+
+    # ==============================================================================
+    # DIRECT GCS STREAMING (ZARR FORMAT) WITH TIMESTAMPS
+    # ==============================================================================
+    if args.output.startswith("gs://"):
+        gcs_output_path = f"{args.output.rstrip('/')}/{timestamp_str}/{args.name}.{cycle_str}.forecast_{lead_str}_{timestamp_str}.zarr"
+        OUTPUT_FILE = gcs_output_path
+        print(f"Streaming forecast dataset directly from TPU memory to GCS: {gcs_output_path}...")
+
+        # Optimize Zarr chunking for Cloud Storage (chunk by entire spatial grids to avoid thousands of tiny HTTP requests)
+        zarr_encoding = {}
+        time_chunk = min(8, args.lead_steps)
+        for v in full_pred.data_vars:
+            dims = full_pred[v].dims
+            chunk_dict = {}
+            if "time" in dims:
+                chunk_dict["time"] = time_chunk
+            if "lat" in dims:
+                chunk_dict["lat"] = len(full_pred.coords["lat"])
+            if "lon" in dims:
+                chunk_dict["lon"] = len(full_pred.coords["lon"])
+            if "level" in dims:
+                chunk_dict["level"] = len(full_pred.coords["level"])
+            if "batch" in dims:
+                chunk_dict["batch"] = 1
+            zarr_encoding[v] = {"chunks": tuple(chunk_dict[d] for d in dims)}
+
+        full_pred.to_zarr(gcs_output_path, mode="w", encoding=zarr_encoding, consolidated=True)
+
+        print(f"Successfully streamed directly to GCS: {gcs_output_path}!")
+    else:
+        output_filename = os.path.join(args.output, f"{args.name}.{cycle_str}.forecast_{lead_str}_{timestamp_str}.nc")
+        OUTPUT_FILE = output_filename
+        print(f"Saving output forecast predictions to local disk: {output_filename}...")
+        full_pred.to_netcdf(output_filename)
+        if os.path.exists(output_filename):
+            file_size_mb = os.path.getsize(output_filename) / (1024 * 1024)
+            print(f"Successfully saved {output_filename} ({file_size_mb:.1f} MB)!")
+
+    print("\n========================================================")
+    print("       AIGFS FORECAST EXECUTION SUMMARY")
+    print("========================================================")
+    print(f"  • Checkpoint:            {os.path.basename(weights_path)}")
+    print(f"  • Forecast Horizon:      {args.lead_steps} steps ({lead_str})")
+    print(f"  • JIT Compilation Time:  {compile_time:.2f} s")
+    print(f"  • TPU Rollout Latency:   {inference_time:.3f} s")
+    print(f"  • Output NetCDF Location:{OUTPUT_FILE}")
+    print("========================================================\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run GraphCast model.")
-    parser.add_argument("-i", "--input", help="input file path (including file name)", required=True)
-    parser.add_argument("-w", "--weights", help="parent directory of the graphcast params and stats", required=True)
-    parser.add_argument("-l", "--length", help="length of forecast (6-hourly), an integer number in range [1, 40]", required=True)
-    parser.add_argument("-n", "--case_name", help="aigfs, or gefs member [aigec00, aigep01, ..., aigep30]", required=True)
-    #parser.add_argument("-c", "--config", help="GC weight member file", required=True)
-    parser.add_argument("-c", "--config", help="GC weight member file", default=None)
-    parser.add_argument("-o", "--output", help="output directory", default=None)
-    parser.add_argument("-p", "--pressure", help="number of pressure levels", default=13)
-    parser.add_argument("-u", "--upload", help="upload input data as well as forecasts to noaa s3 bucket (yes or no)", default = "no")
-    parser.add_argument("-k", "--keep", help="keep input and output after uploading to noaa s3 bucket (yes or no)", default = "no")
-    
-    args = parser.parse_args()
-    runner = GraphCastModel(args.weights, args.input, args.case_name, args.config, args.output, int(args.pressure), int(args.length))
-    
-    t0 = time()
-    runner.load_pretrained_model()
-    elapsed_time = time() - t0
-    print(f"Elapsed time for loading model: {elapsed_time} seconds")
-
-    t0 = time()
-    runner.load_gdas_data()
-    elapsed_time = time() - t0
-    print(f"Elapsed time for loading input data: {elapsed_time} seconds")
-
-    t0 = time()
-    runner.extract_inputs_targets_forcings()
-    elapsed_time = time() - t0
-    print(f"Elapsed time for extracting inputs, targets, and forcings: {elapsed_time} seconds")
-
-    t0 = time()
-    runner.load_normalization_stats()
-    elapsed_time = time() - t0
-    print(f"Elapsed time for loading normalization stats: {elapsed_time} seconds")
-
-    t0 = time()
-    runner.get_predictions()
-    elapsed_time = time() - t0
-    print(f"Elapsed time for running the model: {elapsed_time} seconds")
-    
-    upload_data = args.upload.lower() == "yes"
-    keep_data = args.keep.lower() == "yes"
-    
-    if upload_data:
-        runner.upload_to_s3(keep_data)
+    main()
